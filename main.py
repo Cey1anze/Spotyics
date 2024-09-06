@@ -1,23 +1,29 @@
 import asyncio
 import threading
 import tkinter as tk
-from tkinter import ttk
+from tkinter import Canvas, ttk
 from queue import Queue, Empty
 from get_title import get_spotify_window_title
 from api import get_lrc
+import time
+import win32api
+import win32con
+import win32gui
 
 queue = Queue()
 current_task = None
 label_lyrics = None
 label_translation = None
 root = None
+is_paused = False  # To track if the song is paused
+current_line_index = 0  # To track the current line being displayed
+lyrics_lines = []  # To store the parsed lyrics
+last_displayed_timestamp = 0  # To store the timestamp of the last displayed line
+pause_time = 0  # To store the time when the song was paused
+current_song_title = None  # To store the title of the current song
 
 
 def create_subtitle():
-    """
-    Create a subtitle window to display lyrics and translations.
-
-    """
     global label_lyrics, label_translation, root
 
     root = tk.Tk()
@@ -27,7 +33,6 @@ def create_subtitle():
     screen_width = root.winfo_screenwidth()
     screen_height = root.winfo_screenheight()
 
-    # Set the window size and position it at the bottom of the screen
     root.geometry(
         f"{screen_width}x100+0+{screen_height - 100}"
     )  # Full width, bottom of the screen
@@ -65,7 +70,6 @@ def create_subtitle():
     )
     label_translation.pack()
 
-    # Run the Tkinter event loop
     def check_queue():
         try:
             lyrics = queue.get_nowait()
@@ -79,30 +83,23 @@ def create_subtitle():
 
 
 def update_lyrics(lrc):
-    """
-    Update the lyrics display with the provided LRC format lyrics.
+    global current_task, label_lyrics, label_translation, lyrics_lines, current_line_index, last_displayed_timestamp
 
-    Args:
-        lrc (str): The lyrics in LRC format.
-
-    """
-    global current_task, label_lyrics, label_translation
-
-    # Cancel any previous scheduled tasks
     if current_task is not None:
         root.after_cancel(current_task)
 
-    # Clear any remaining lyrics
     label_lyrics.config(text="")
     label_translation.config(text="")
 
-    # Parse lyrics and timestamps
-    lyrics_lines = []
+    lyrics_lines.clear()  # Clear old lyrics
+    current_line_index = 0  # Reset the current line index
+    last_displayed_timestamp = 0  # Reset the last displayed timestamp
+
     for line in lrc.splitlines():
         if line.startswith("[") and "]" in line:
             timestamp = line.split("]")[0]
             text_with_translation = line.split("]")[1].strip()
-            # Split text and translation
+
             parts = text_with_translation.split("(")
             if len(parts) == 2:
                 lyrics_text = parts[0].strip()
@@ -118,65 +115,47 @@ def update_lyrics(lrc):
     if not lyrics_lines:
         return
 
-    def display_line(index):
-        """
-        Displays the lyrics and translation for a given index in the lyrics_lines list.
+    display_line(current_line_index)  # Start displaying lyrics from the first line
 
-        Args:
-            index (int): The index of the line to be displayed.
 
-        """
-        if index >= len(lyrics_lines):
-            return
+def display_line(index):
+    global current_task, is_paused, current_line_index, last_displayed_timestamp, pause_time
 
-        timestamp, lyrics_text, translation_text = lyrics_lines[index]
-        label_lyrics.config(text=lyrics_text)
-        label_translation.config(text=translation_text)
+    if is_paused or index >= len(lyrics_lines):
+        return
 
-        # Calculate delay for the next line
-        if index + 1 < len(lyrics_lines):
-            next_timestamp = lyrics_lines[index + 1][0]
-        else:
-            next_timestamp = (
-                timestamp + 5
-            )  # Default to 5 seconds delay for the last line
+    current_line_index = index  # Update the current line index
 
-        delay = max(0, (next_timestamp - timestamp) * 1000)  # Convert to milliseconds
-        global current_task
-        current_task = root.after(
-            int(delay), lambda: display_line(index + 1)
-        )  # Schedule next line
+    timestamp, lyrics_text, translation_text = lyrics_lines[index]
+    label_lyrics.config(text=lyrics_text)
+    label_translation.config(text=translation_text)
 
-    display_line(0)
+    last_displayed_timestamp = timestamp  # Update the last displayed timestamp
+
+    if index + 1 < len(lyrics_lines):
+        next_timestamp = lyrics_lines[index + 1][0]
+    else:
+        next_timestamp = timestamp + 5  # Default to 5 seconds delay for the last line
+
+    delay = max(0, (next_timestamp - timestamp) * 1000)
+
+    # Adjust the delay if resuming after a pause
+    if pause_time > 0:
+        elapsed_pause_time = time.time() - pause_time
+        delay -= int(elapsed_pause_time * 1000)
+        pause_time = 0  # Reset pause time
+
+    current_task = root.after(int(delay), lambda: display_line(index + 1))
 
 
 def parse_timestamp(timestamp):
-    """
-    Convert a timestamp [00:00.00] to seconds.
-
-    Args:
-        timestamp (str): The timestamp string in the format [MM:SS.SS].
-
-    Returns:
-        timestamp (float): The converted timestamp in seconds.
-    """
     minutes, seconds = timestamp[1:3], timestamp[4:9]
     return int(minutes) * 60 + float(seconds)
 
 
 async def monitor():
-    """
-    Monitors the Spotify window title and retrieves the lyrics for the currently playing song.
+    global is_paused, current_task, current_line_index, last_displayed_timestamp, pause_time, current_song_title
 
-    This function continuously checks for changes in the Spotify window title. If the title changes,
-    it prints a message indicating that the music has changed. It then retrieves the lyrics for the
-    current song and adds them to a queue.
-
-    Note: This function assumes the existence of the following functions:
-    - get_spotify_window_title(): Retrieves the current Spotify window title.
-    - get_lrc(title): Retrieves the lyrics for the given song title.
-
-    """
     last_title = None
     while True:
         current_title = await get_spotify_window_title()
@@ -185,10 +164,29 @@ async def monitor():
             last_title = current_title
             print(f"Music changed: {current_title}")
 
-            lrc = await get_lrc(current_title)
-            if lrc:
-                queue.queue.clear()
-                queue.put(lrc)
+            if current_title.lower() in ["spotify", "spotify free"]:
+                if not is_paused:
+                    is_paused = True
+                    pause_time = time.time()  # Record the pause time
+                    if current_task is not None:
+                        root.after_cancel(current_task)  # Pause lyrics
+            else:
+                if is_paused:
+                    is_paused = False
+                    if current_song_title != current_title:  # Check if the song has changed
+                        lrc = await get_lrc(current_title)
+                        if lrc:
+                            queue.queue.clear()
+                            queue.put(lrc)
+                            current_song_title = current_title  # Update the current song title
+                    else:
+                        display_line(current_line_index)  # Resume from the current line
+                else:
+                    lrc = await get_lrc(current_title)
+                    if lrc:
+                        queue.queue.clear()
+                        queue.put(lrc)
+                        current_song_title = current_title  # Update the current song title
 
 
 async def main():

@@ -21,4 +21,17 @@ async def get_spotify_window_title():
     windows = []
     win32gui.EnumWindows(callback, windows)
 
+    # print(windows[0])
+
     return windows[0] if windows else None
+
+
+async def main():
+    while True:
+        await get_spotify_window_title()
+
+
+if __name__ == "__main__":
+    import asyncio
+
+    asyncio.run(main=main())
